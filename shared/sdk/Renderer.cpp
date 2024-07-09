@@ -7,6 +7,7 @@
 
 #include "Application.hpp"
 #include "RETypeDB.hpp"
+#include "RETypes.hpp"
 #include "SceneManager.hpp"
 
 #include "Renderer.hpp"
@@ -309,6 +310,28 @@ std::vector<layer::Scene*> RenderLayer::find_fully_rendered_scene_layers() {
 
 RenderLayer* RenderLayer::get_parent() {
     return sdk::call_object_func<RenderLayer*>(this, "get_Parent", sdk::get_thread_context(), this);
+}
+
+void RenderLayer::set_parent(RenderLayer* layer) {
+    static std::optional<uint32_t> offset = std::nullopt;
+
+    if (!offset) {
+        const auto parent = get_parent();
+
+        if (parent != nullptr) {
+            for (auto i = 0; i < 0x100; i += sizeof(void*)) {
+                if (*(RenderLayer**)((uintptr_t)this + i) == parent) {
+                    offset = i;
+                    spdlog::info("[Renderer] Parent offset: {:x}", i);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (offset.has_value()) {
+        *(RenderLayer**)((uintptr_t)this + *offset) = layer;
+    }
 }
 
 RenderLayer* RenderLayer::find_parent(::REType* layer_type) {
@@ -634,6 +657,63 @@ void RenderContext::dispatch(uint32_t tgx, uint32_t tgy, uint32_t tgz, bool disa
     func(this, tgx, tgy, tgz, disable_uav_barrier);
 }
 
+sdk::renderer::command::Base* RenderContext::alloc(uint32_t t, uint32_t size) {
+    // I am just being very lazy right now and just using a pattern instead of 
+    // using copy_texture and scanning through the function for the first call
+    static auto func = []() -> sdk::renderer::command::Base* (*)(RenderContext*, uint32_t, uint32_t) {
+        spdlog::info("Searching for RenderContext::alloc");
+
+        const auto game = utility::get_executable();
+        const auto scan_result = utility::scan(game, "48 8b ? 44 8d 42 38 e8 ? ? ? ?");
+
+        if (!scan_result) {
+            spdlog::error("Failed to find RenderContext::alloc");
+            return nullptr;
+        }
+
+        const auto result = utility::calculate_absolute(*scan_result + 8);
+
+        return (sdk::renderer::command::Base* (*)(RenderContext*, uint32_t, uint32_t))result;
+    }();
+
+    return func(this, t, size);
+}
+
+static_assert(offsetof(command::Clear, clear_color) == 0x28, "Clear::clear_color offset is wrong");
+static_assert(offsetof(command::Clear, view) == 0x20, "Clear::view offset is wrong");
+static_assert(offsetof(command::Clear, target) == 0x18, "Clear::target offset is wrong");
+
+void RenderContext::clear_rtv(sdk::renderer::RenderTargetView* rtv, float color[4], bool delay) {
+    if (rtv == nullptr) {
+        return;
+    }
+
+    static const auto clear_typeid = sdk::get_enum_value<uint32_t>("via.render.command.TypeId", "Clear");
+    auto new_command = (command::Clear*)alloc(clear_typeid, sizeof(command::Clear));
+
+    if (new_command != nullptr) {
+        const auto protect_frame = get_protect_frame();
+
+        if (rtv->m_render_frame != protect_frame) {
+            rtv->m_render_frame = protect_frame;
+        }
+
+        new_command->target = get_render_target();
+
+        if (delay && is_delay_enabled()) {
+            new_command->clear_type = 128;
+        } else {
+            new_command->clear_type = 0;
+        }
+
+        new_command->view.rtv = rtv;
+        new_command->clear_color[0] = color[0];
+        new_command->clear_color[1] = color[1];
+        new_command->clear_color[2] = color[2];
+        new_command->clear_color[3] = color[3];
+    }
+}
+
 /*
 - 0x9B CopyImage
 + 0x93 ReadonlyDepth
@@ -654,11 +734,42 @@ void RenderContext::dispatch(uint32_t tgx, uint32_t tgy, uint32_t tgz, bool disa
 - 0xD InterleaveNormalDepthHalfWithoutGBuffer
 */
 void RenderContext::copy_texture(Texture* dest, Texture* src, Fence& fence) {
+    // Okay it was actually this simple in older games but it isn't anymore in DD2+
+    // There's some extra garbage going on that I don't want to deal with right now
+    // so will just call the function directly
+/*#if TDB_VER >= 73
+    static const auto copy_texture_typeid = sdk::get_enum_value<uint32_t>("via.render.command.TypeId", "CopyTexture");
+    auto new_command = (command::CopyTexture*)alloc(copy_texture_typeid, sizeof(command::CopyTexture));
+
+    if (new_command != nullptr) {
+        const auto protect_frame = get_protect_frame();
+
+        if (dest->m_render_frame != protect_frame) {
+            dest->m_render_frame = protect_frame;
+        }
+
+        if (src->m_render_frame != protect_frame) {
+            src->m_render_frame = protect_frame;
+        }
+
+        new_command->dst = dest;
+        new_command->src = src;
+        new_command->fence = fence;
+        new_command->dst_subresource = -1;
+        new_command->src_subresource = -1;
+    }
+    
+    return;
+#else*/
     static auto func = []() -> void (*)(RenderContext*, Texture*, Texture*, Fence&) {
         spdlog::info("Searching for RenderContext::copy_texture");
 
         std::vector<std::string> string_choices {
+            // CopyTexture isn't directly behind InterleaveNormalDepthHalfWithoutGBuffer in DD2+
+#if TDB_VER < 73
             "InterleaveNormalDepthHalfWithoutGBuffer",
+#endif
+            "opyImage", // Engine has a weird optimization sometimes where it starts from the +1 offset
             "CopyImage",
         };
 
@@ -708,6 +819,7 @@ void RenderContext::copy_texture(Texture* dest, Texture* src, Fence& fence) {
     }();
 
     func(this, dest, src, fence);
+//#endif
 }
 
 std::optional<uint32_t> Renderer::get_render_frame() const {
@@ -1128,8 +1240,8 @@ TargetState* create_target_state(TargetState::Desc* desc) {
 + 0xD9 systems/shader/speedTree/speedTree.sdf
 - 0x18 width=%u,height=%u,depth=%u,mip=%u,array=%u,format=%u,usage=%u,bind=%u
 */
-Texture* create_texture(void* desc) {
-    static auto fn = []() -> Texture* (*)(void*, void*) {
+Texture* create_texture(Texture::Desc* desc) {
+    static auto fn = []() -> Texture* (*)(void*, Texture::Desc*) {
         spdlog::info("Searching for create_texture");
 
         const auto game = utility::get_executable();
@@ -1160,7 +1272,7 @@ Texture* create_texture(void* desc) {
             ip = resolved->addr;
 
             if (*(uint8_t*)ip == 0xE8) {
-                const auto result = (Texture* (*)(void*, void*))utility::calculate_absolute(ip + 1);
+                const auto result = (Texture* (*)(void*, Texture::Desc*))utility::calculate_absolute(ip + 1);
 
                 spdlog::info("Found create_texture: {:x}", (uintptr_t)result);
                 return result;
@@ -1172,7 +1284,8 @@ Texture* create_texture(void* desc) {
         return nullptr;
     }();
 
-    return fn(nullptr, desc);
+    static auto renderer = sdk::renderer::get_renderer();
+    return fn(renderer->get_device(), desc);
 }
 
 /*
@@ -1286,7 +1399,7 @@ Texture* Texture::clone() {
     return sdk::renderer::create_texture(get_desc());
 }
 
-RenderTargetView* RenderTargetView::clone() {
+sdk::intrusive_ptr<RenderTargetView> RenderTargetView::clone() {
     auto tex = this->get_texture_d3d12();
 
     if (tex == nullptr) {
@@ -1296,11 +1409,74 @@ RenderTargetView* RenderTargetView::clone() {
     return sdk::renderer::create_render_target_view(tex->clone(), &get_desc());
 }
 
-TargetState* TargetState::clone() {
+sdk::intrusive_ptr<RenderTargetView> RenderTargetView::clone(uint32_t new_width, uint32_t new_height) {
+    auto tex = this->get_texture_d3d12();
+
+    if (tex == nullptr) {
+        return nullptr;
+    }
+
+    return sdk::renderer::create_render_target_view(tex->clone(new_width, new_height), &get_desc());
+}
+
+namespace detail {
+#if TDB_VER >= 71
+#if defined(SF6) || defined(DD2)
+    constexpr auto rtv_size = 0x98;
+#else
+    constexpr auto rtv_size = 0x98 - sizeof(void*);
+#endif
+#elif TDB_VER == 70
+    constexpr auto rtv_size = 0x90 - sizeof(void*);
+#elif TDB_VER == 69
+    constexpr auto rtv_size = 0x88 - sizeof(void*);
+#elif TDB_VER <= 67
+// TODO: 66 and below
+    constexpr auto rtv_size = 0x88 - sizeof(void*);
+#endif
+}
+
+sdk::intrusive_ptr<Texture>& RenderTargetView::get_texture_d3d12() const {
+    // The via.render.RenderTargetView is not part of the normal TDB... I think.
+    static const auto rtv_type = reframework::get_types()->get("via.render.RenderTargetView");
+
+    // The texture and target state members are always at the very start of the RenderTargetViewDX12 structure
+    // so we can very easily automate it like this, otherwise we fall back to the hardcoded offset
+    if (rtv_type != nullptr && rtv_type->size > 0 && rtv_type->size < 0x1000) {
+        const auto rtv_size = rtv_type->size;
+
+#if TDB_VER < 73
+        return *(sdk::intrusive_ptr<Texture>*)((uintptr_t)this + rtv_size + sizeof(void*));
+#else
+        return *(sdk::intrusive_ptr<Texture>*)((uintptr_t)this + rtv_size + (sizeof(void*) * 3));
+#endif
+    }
+    
+#if TDB_VER < 73
+    return *(sdk::intrusive_ptr<Texture>*)((uintptr_t)this + detail::rtv_size + sizeof(void*));
+#else
+    return *(sdk::intrusive_ptr<Texture>*)((uintptr_t)this + detail::rtv_size + (sizeof(void*) * 3));
+#endif
+}
+
+sdk::intrusive_ptr<TargetState>& RenderTargetView::get_target_state_d3d12() const {
+    // The via.render.RenderTargetView is not part of the normal TDB... I think.
+    static const auto rtv_type = reframework::get_types()->get("via.render.RenderTargetView");
+
+    if (rtv_type != nullptr && rtv_type->size > 0 && rtv_type->size < 0x1000) {
+        const auto rtv_size = rtv_type->size;
+
+        return *(sdk::intrusive_ptr<TargetState>*)((uintptr_t)this + rtv_size);
+    }
+    
+    return *(sdk::intrusive_ptr<TargetState>*)((uintptr_t)this + detail::rtv_size);
+}
+
+sdk::intrusive_ptr<TargetState> TargetState::clone() const {
     auto cloned_desc = get_desc();
 
     if (cloned_desc.num_rtv > 0) {
-        cloned_desc.rtvs = (sdk::renderer::RenderTargetView**)sdk::memory::allocate(cloned_desc.num_rtv * sizeof(void*));
+        cloned_desc.rtvs = (decltype(cloned_desc.rtvs))sdk::memory::allocate(cloned_desc.num_rtv * sizeof(void*));
 
         for (auto i = 0; i < cloned_desc.num_rtv; ++i) {
             auto rtv = get_rtv(i);
@@ -1310,6 +1486,37 @@ TargetState* TargetState::clone() {
             }
 
             cloned_desc.rtvs[i] = rtv->clone();
+        }
+    } else {
+        cloned_desc.rtvs = nullptr;
+    }
+
+    return sdk::renderer::create_target_state(&cloned_desc);
+}
+
+sdk::intrusive_ptr<TargetState> TargetState::clone(const std::vector<std::array<uint32_t, 2>>& new_dimensions) const {
+    auto cloned_desc = get_desc();
+
+    if (cloned_desc.num_rtv > 0) {
+        cloned_desc.rtvs = (decltype(cloned_desc.rtvs))sdk::memory::allocate(cloned_desc.num_rtv * sizeof(void*), true);
+
+        for (auto i = 0; i < cloned_desc.num_rtv; ++i) {
+            auto rtv = get_rtv(i);
+
+            if (rtv == nullptr) {
+                continue;
+            }
+
+            if (i < new_dimensions.size()) {
+                if (i == 0) {
+                    cloned_desc.rect.right = (float)new_dimensions[i][0];
+                    cloned_desc.rect.bottom = (float)new_dimensions[i][1];
+                }
+
+                cloned_desc.rtvs[i] = rtv->clone(new_dimensions[i][0], new_dimensions[i][1]);
+            } else {
+                cloned_desc.rtvs[i] = rtv->clone();
+            }
         }
     } else {
         cloned_desc.rtvs = nullptr;
@@ -1423,9 +1630,24 @@ RECamera* layer::Scene::get_main_camera_if_possible() const {
         return nullptr;
     }
 
-    if (utility::re_string::get_view(camera_gameobject->name) == L"MainCamera" ||
-        utility::re_string::get_view(camera_gameobject->name) == L"Main Camera") {
-        return camera;
+    const auto name = utility::re_string::get_view(camera_gameobject->name);
+
+    static const std::vector<std::wstring> camera_names = {
+        L"MainCamera",
+        L"Main Camera",
+        L"GameCamera", // DMC5
+        L"ess_DefaultCamera",
+        L"ess_DefaultCamera_01",
+        L"WTMainCamera",
+        L"DefaultCamera",
+        L"Camera_mainmenu",
+        L"Camera_cp7mainmenu",
+    };
+
+    for (const auto& camera_name : camera_names) {
+        if (name.starts_with(camera_name)) {
+            return camera;
+        }
     }
 
     return nullptr;
